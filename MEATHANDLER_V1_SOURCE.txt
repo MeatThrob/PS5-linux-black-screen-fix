@@ -1,0 +1,257 @@
+================================================================================
+MEATHANDLER v1 — AUTO EDID BOOT HANDLER — FULL SOURCE
+Verified working 2026-05-24 on PS5 Linux kernel 7.0.5
+ASUS VG27WQ 2560x1440@60Hz + 4K TV 3840x2160@60Hz
+================================================================================
+
+To re-install from scratch on a fresh PS5 Linux install:
+  sudo mkdir -p /boot/efi && sudo mount /dev/sdb2 /boot/efi
+  Then paste each file below into the correct path.
+
+================================================================================
+FILE 1 of 4 — /usr/local/sbin/ps5-autoedid
+  (chmod +x after creating)
+  Runs on every boot via systemd. Reads live EDID, normalizes pclk, writes
+  /lib/firmware/edid/auto.bin. Logs to /var/log/ps5-autoedid.log.
+================================================================================
+
+#!/bin/bash
+set -u
+LOG=/var/log/ps5-autoedid.log
+SYSFS_EDID=/sys/class/drm/card0-DP-1/edid
+SYSFS_FORCE=/sys/class/drm/card0-DP-1/force
+FW_DIR=/lib/firmware/edid
+FW_FILE="$FW_DIR/auto.bin"
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+mkdir -p "$FW_DIR"
+exec >> "$LOG" 2>&1
+
+log "=== ps5-autoedid run starting ==="
+
+for i in $(seq 1 30); do
+    if [ $(wc -c < "$SYSFS_EDID" 2>/dev/null || echo 0) -gt 0 ]; then break; fi
+    sleep 0.1
+done
+if [ $(wc -c < "$SYSFS_EDID" 2>/dev/null || echo 0) -eq 0 ]; then
+    log "sysfs EDID empty after 3s — leaving existing auto.bin in place"
+    exit 0
+fi
+
+RAW=$(mktemp)
+cp "$SYSFS_EDID" "$RAW"
+RAW_SIZE=$(stat -c%s "$RAW")
+RAW_SHA=$(sha256sum "$RAW" | cut -d' ' -f1)
+log "live EDID: $RAW_SIZE bytes, sha256=$RAW_SHA"
+
+python3 - "$RAW" "$FW_FILE" <<'PY_EOF'
+import sys, struct, os, hashlib
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src,'rb').read()
+if len(data) < 128:
+    print(f"FAIL: EDID is {len(data)} bytes, need >=128")
+    sys.exit(2)
+if data[:8] != bytes([0,255,255,255,255,255,255,0]):
+    if data[0] == 0x01 and data[1:8] == bytes([255,255,255,255,255,255,0]):
+        data = b'\x00' + data[1:]
+        print("note: fixed PS5 byte-0 quirk")
+    else:
+        print(f"FAIL: bad EDID magic: {data[:8].hex()}")
+        sys.exit(3)
+
+base = bytearray(data[:128])
+WHITELIST = [148500, 241500, 241700, 297000, 594000]
+pclk = int.from_bytes(base[54:56], 'little') * 10
+nearest = min(WHITELIST, key=lambda v: abs(v - pclk))
+if pclk != nearest:
+    new_pclk_raw = nearest // 10
+    base[54] = new_pclk_raw & 0xFF
+    base[55] = (new_pclk_raw >> 8) & 0xFF
+    print(f"normalized DTD pclk: {pclk} -> {nearest} kHz")
+base[126] = 0
+s = sum(base[:127]) & 0xFF
+base[127] = (256 - s) & 0xFF
+if sum(base) % 256 != 0:
+    print("FAIL: checksum did not converge")
+    sys.exit(5)
+mfr_raw = (base[8] << 8) | base[9]
+mfr = ''.join(chr(((mfr_raw >> shift) & 0x1F) + ord('A') - 1) for shift in (10, 5, 0))
+product = (base[11] << 8) | base[10]
+out_sha = hashlib.sha256(bytes(base)).hexdigest()
+print(f"identity: {mfr} 0x{product:04x}")
+print(f"final EDID: 128 bytes, ext=0, pclk={int.from_bytes(base[54:56],'little')*10} kHz, sha256={out_sha}")
+tmp = dst + '.tmp'
+open(tmp,'wb').write(bytes(base))
+os.replace(tmp, dst)
+print(f"wrote {dst}")
+PY_EOF
+RC=$?
+rm -f "$RAW"
+if [ $RC -ne 0 ]; then
+    log "EDID normalization failed (rc=$RC) — NOT replacing existing EDID"
+    exit 0
+fi
+
+FINAL_SHA=$(sha256sum "$FW_FILE" | cut -d' ' -f1)
+log "wrote $FW_FILE sha256=$FINAL_SHA"
+
+if [ -w "$SYSFS_FORCE" ]; then
+    echo detect > "$SYSFS_FORCE" 2>/dev/null && log "triggered DRM detect"
+fi
+if command -v udevadm >/dev/null; then
+    udevadm trigger --subsystem-match=drm --action=change >/dev/null 2>&1 || true
+fi
+
+log "=== ps5-autoedid run complete ==="
+
+
+================================================================================
+FILE 2 of 4 — /etc/systemd/system/ps5-autoedid.service
+  After creating: systemctl daemon-reload && systemctl enable ps5-autoedid.service
+================================================================================
+
+[Unit]
+Description=PS5 Display Wizard — auto EDID normalizer
+DefaultDependencies=no
+After=systemd-tmpfiles-setup.service
+Before=display-manager.service graphical.target multi-user.target
+ConditionPathExists=/sys/class/drm/card0-DP-1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ps5-autoedid
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+
+
+================================================================================
+FILE 3 of 4 — /etc/initramfs-tools/hooks/ps5-autoedid
+  (chmod +x after creating)
+  Copies tools into the initramfs image at build time.
+================================================================================
+
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /usr/share/initramfs-tools/hook-functions
+copy_exec /usr/bin/sha256sum || true
+copy_exec /bin/dd
+copy_exec /usr/bin/python3 || true
+
+
+================================================================================
+FILE 4 of 4 — /etc/initramfs-tools/scripts/init-top/ps5-autoedid
+  (chmod +x after creating)
+  Runs in initramfs BEFORE the M.2 mounts, BEFORE amdgpu probes.
+  Writes /run/firmware/edid/auto.bin so amdgpu finds it on first probe.
+  After creating: sudo update-initramfs -u && sudo cp /boot/initrd.img-7.0.5 /boot/efi/initrd.img
+================================================================================
+
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+
+SYSFS_EDID=/sys/class/drm/card0-DP-1/edid
+OUT_DIR=/run/firmware/edid
+OUT=/run/firmware/edid/auto.bin
+LOG=/run/ps5-autoedid-initramfs.log
+
+mkdir -p "$OUT_DIR"
+log() { echo "[initramfs] $*" >> "$LOG"; echo "ps5-autoedid: $*" > /dev/kmsg 2>/dev/null || true; }
+
+i=0
+while [ $i -lt 20 ]; do
+    [ $(wc -c < "$SYSFS_EDID" 2>/dev/null || echo 0) -gt 0 ] && break
+    sleep 0.1
+    i=$((i+1))
+done
+
+if [ $(wc -c < "$SYSFS_EDID" 2>/dev/null || echo 0) -eq 0 ]; then
+    log "no sysfs EDID after 2s — skipping"
+    exit 0
+fi
+
+cp "$SYSFS_EDID" /run/edid-live.bin
+log "live EDID: $(wc -c < /run/edid-live.bin) bytes"
+
+if command -v python3 >/dev/null 2>&1; then
+    python3 - /run/edid-live.bin "$OUT" <<'PY'
+import sys, os
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src,'rb').read()
+if len(data) < 128: sys.exit(2)
+if data[0] == 0x01 and data[1:8] == bytes([255]*7):
+    data = b'\x00' + data[1:]
+base = bytearray(data[:128])
+WHITELIST = [148500, 241500, 241700, 297000, 594000]
+pclk = int.from_bytes(base[54:56], 'little') * 10
+nearest = min(WHITELIST, key=lambda v: abs(v - pclk))
+new_raw = nearest // 10
+base[54] = new_raw & 0xFF
+base[55] = (new_raw >> 8) & 0xFF
+base[126] = 0
+s = sum(base[:127]) & 0xFF
+base[127] = (256 - s) & 0xFF
+tmp = dst + '.tmp'
+open(tmp,'wb').write(bytes(base))
+os.replace(tmp, dst)
+PY
+    RC=$?
+else
+    dd if=/run/edid-live.bin of="$OUT" bs=128 count=1 status=none
+    RC=0
+    log "WARN: python3 not in initramfs — used dd fallback"
+fi
+
+[ $RC -eq 0 ] && log "wrote $OUT" || log "normalize failed rc=$RC"
+
+
+================================================================================
+CMDLINE (what /boot/efi/cmdline.txt must contain)
+================================================================================
+
+root=LABEL=ubuntu2604-m2 rw rootwait console=ttyTitania0 console=tty0 mitigations=off idle=halt preempt=full drm.edid_firmware=DP-1:edid/auto.bin video=DP-1:e firmware_class.path=/run/firmware snd_hda_intel.enable_dp_mst=0
+
+
+================================================================================
+INSTALL ORDER (fresh install)
+================================================================================
+
+1. Mount USB:        sudo mkdir -p /boot/efi && sudo mount /dev/sdb2 /boot/efi
+2. Create FILE 1:    sudo nano /usr/local/sbin/ps5-autoedid  (paste, save)
+                     sudo chmod +x /usr/local/sbin/ps5-autoedid
+3. Create FILE 2:    sudo nano /etc/systemd/system/ps5-autoedid.service
+                     sudo systemctl daemon-reload
+                     sudo systemctl enable ps5-autoedid.service
+4. Create FILE 3:    sudo nano /etc/initramfs-tools/hooks/ps5-autoedid
+                     sudo chmod +x /etc/initramfs-tools/hooks/ps5-autoedid
+5. Create FILE 4:    sudo nano /etc/initramfs-tools/scripts/init-top/ps5-autoedid
+                     sudo chmod +x /etc/initramfs-tools/scripts/init-top/ps5-autoedid
+6. Regen initrd:     sudo update-initramfs -u
+                     sudo cp /boot/initrd.img-7.0.5 /boot/efi/initrd.img
+7. Update cmdline:   sudo nano /boot/efi/cmdline.txt  (paste cmdline above)
+8. Run once now:     sudo /usr/local/sbin/ps5-autoedid
+9. Mirror to USB:    sudo mkdir -p /boot/efi/edid
+                     sudo cp /lib/firmware/edid/auto.bin /boot/efi/edid/auto.bin
+10. Reboot and verify: cat /var/log/ps5-autoedid.log
+
+================================================================================
+KERNEL WHITELIST (pclk values isHdmiModeValid() accepts — as of kernel 7.0.5)
+================================================================================
+
+148500 kHz  =  1920x1080 @ 60Hz   (VIC 16)
+241500 kHz  =  2560x1440 @ 60Hz   (CEA canonical)
+241700 kHz  =  2560x1440 @ 60Hz   (alt)
+297000 kHz  =  1920x1080 @ 120Hz  (VIC 63)
+594000 kHz  =  3840x2160 @ 60Hz   (VIC 97, auto 4:2:0)
+
+Any other pclk = black screen. The handler rounds to nearest automatically.
+
+================================================================================
+END OF MEATHANDLER v1 SOURCE
+================================================================================
