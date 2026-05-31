@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>MeatHandler</vendor>
+  <action id="com.meathandler.display.launch">
+    <description>Run MeatHandler Display switcher</description>
+    <message>Authentication is required to switch PS5 displays</message>
+    <!--
+      allow_active=yes: the seat-active local desktop user (the person
+      logged in at the PS5 console) launches the Displays GUI without a
+      password. Remote/inactive sessions still authenticate as admin.
+      This action matches the helper invoked by pkexec; exec.path MUST
+      equal the exact program pkexec runs (the launcher script), not a
+      generic interpreter like /usr/bin/python3 — otherwise pkexec falls
+      back to its built-in org.freedesktop.policykit.exec action, which
+      always prompts for a password.
+    -->
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/meathandler-gui-root</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

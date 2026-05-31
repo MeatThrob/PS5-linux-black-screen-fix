@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Displays
+Comment=Use Night Light and choose how to use connected monitors and projectors
+Exec=/usr/local/bin/meathandler-gui
+Icon=org.gnome.Settings-display-symbolic
+Terminal=false
+Type=Application
+NoDisplay=true
+StartupNotify=true
+Categories=GNOME;GTK;Settings;HardwareSettings;X-GNOME-Settings-Panel;X-GNOME-DevicesSettings;
+OnlyShowIn=GNOME;Unity;
+Keywords=Panel;Projector;xrandr;Screen;Resolution;Refresh;Monitor;Night;Light;Blue;redshift;color;sunset;sunrise;
+X-Ubuntu-Gettext-Domain=gnome-control-center-2.0
